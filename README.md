@@ -1,146 +1,153 @@
 # ki
 
-A small CLI for capturing notes into plain markdown files. I built it because
-my braindumps kept dying in monthly notes I never reopened, and because my
-agent sessions needed a place to save their state that wasn't tied to one tool.
-It's built for my own workflow first — it might fit yours, it might not.
+A small CLI for a work vault of plain markdown files. Buckets ARE projects
+(`miso`, `ki-cli`, `home`), and everything captured is an action item — no
+todo/idea/note taxonomy, no categorizing. It's built for my own workflow
+first — it might fit yours, it might not.
 
 The one design rule: **an LLM only ever produces content, never structure.**
-Paths, categories, file naming, search ranking, index projection — all
-deterministic and owned by this binary. The model is called in exactly one
-place (classification) and everything it returns is validated, previewed, and
-placed by code. If the classifier is wrong, you see it before anything is
-written.
+Paths, file naming, parsing, rendering — all deterministic and owned by this
+binary. The model is called in exactly one place (breaking a braindump into
+steps) and everything it returns is previewed before a byte is written.
 
-No third-party dependencies. Storage is plain markdown with a little
-frontmatter — any editor or note app works on top of it. `[[wikilinks]]` are
-understood by search but are just text.
+No third-party dependencies. Storage is plain markdown — any editor or note
+app works on top of it.
 
 ## How it thinks
 
-- Everything captured is an **item**: a one-line todo, a pasted code review, or
-  a whole session distillate. One file each, append-only, sorted into a small
-  set of configurable **buckets** (todo / idea / question / review / note /
-  session by default).
-- A **topic** is just a `topic:` value on items — linking is cheap, and a topic
-  needs no setup to exist. A curated **topic page** is optional and comes later,
-  only if a topic recurs enough to be worth compressing. Items stay the source
-  of truth; pages are disposable summaries.
+- A **bucket** is a project. Creating one requires a one-line description —
+  that description is the only project context the LLM ever gets.
+- A **one-liner** is a timestamped checkbox line in the bucket's single
+  `log.md`, newest first. Captured instantly, no LLM.
+- A **dump** is a braindump the LLM has split into a titled file of terse
+  checkbox steps. The steps are pointers, not explanations — the real context
+  lives in the project repo, and an agent working there will understand them.
+- Done state is just the checkbox. Tick it from the CLI, your editor, or let
+  an agent do it as it finishes things.
 
 ## Install
 
-Needs Go. For classification, any [Claude Code](https://claude.com/claude-code)
-install (it shells out to `claude -p` with a small model); everything except
-`jot`'s auto-classification and `import` works without it.
+Needs Go. For `dump`, any [Claude Code](https://claude.com/claude-code)
+install (it shells out to `claude -p` with a small model); everything else
+works without it.
 
 ```sh
 git clone https://github.com/yeraassyl/ki && cd ki
 go test ./...
 go install .          # → $(go env GOPATH)/bin/ki, put that on PATH
-ki init               # creates ~/ki/.ki/config.json and the bucket dirs
+ki init               # creates ~/ki and .ki/config.json
 ```
 
-The root defaults to `~/ki` (override with `$KI_ROOT`). `init` is
-non-destructive — safe to run inside an existing notes folder.
+The root defaults to `~/ki` (override with `$KI_ROOT`). If `init` finds a
+v0.7 vault there, it renames it to `~/ki-archive` (with confirmation) and
+starts fresh.
 
 ## Using it
 
-Capture (the main loop — keep a terminal open, type when a thought hits):
+Create a project:
 
 ```sh
-ki jot "ask ops about the cert rotation before friday"
+ki bucket add miso "personal finance app; Go backend, LLM transaction parsing"
+ki bucket add home "personal reminders and life admin"
 ```
 
-The classifier picks a bucket, extracts a title, resolves "friday" to a date.
-You get a preview and a `[Y] save [e] edit [b] bucket [n] cancel` prompt —
-nothing is written without your eyes on it. Skip the model entirely with
-`-b`: `ki jot -b todo --due 2026-07-20 "renew certs"`. Pipe works too:
-`pbpaste | ki jot`.
+Capture one-liners (no LLM, instant):
+
+```sh
+ki jot "try nuextract3 for extraction" -b miso
+ki jot "collect documents for visa extension" -b home
+```
+
+Dump a braindump (the one LLM call — split into steps, preview, confirm):
+
+```sh
+ki dump "auth tests are flaky, probably the clock. also the retry hack needs to go" -b miso
+```
+
+```
+┌─ proposed dump ──────────────────────────────
+│ bucket : miso
+│ file   : miso/fix-flaky-auth-tests.md
+│ title  : fix flaky auth tests
+│ steps  :
+│   - [ ] reproduce flake locally
+│   - [ ] mock clock in auth tests
+│   - [ ] delete retry hack
+└──────────────────────────────────────────────
+[Y] save  [e] edit  [n] cancel >
+```
+
+See where things stand:
+
+```sh
+ki view              # every bucket: fresh | aging columns, dump progress
+ki view -b miso      # one project
+ki view -b miso --full   # raw files — pipe this to an agent
+```
+
+```
+miso — personal finance app; Go backend, LLM transaction parsing  (4 open / 2 done)
+──────────────────────────────────────────────────────────────────────
+fresh (<7d)                                    │ aging (≥7d)
+- [ ] 07-18 14:03 try nuextract3 for extraction│ - [ ] 07-02 profile the parser
+dumps:
+  fix-flaky-auth-tests                     (1/3)  3d ago
+```
 
 Close things:
 
 ```sh
-ki done "cert rotation"     # matches open items by id or title terms
+ki done "nuextract"          # ticks the matching log line or dump step
+ki done "retry hack" -b miso
 ```
 
-Get things back:
+## Agents
+
+`ki view -b <bucket> --json` is the integration surface: a Claude Code
+session in the project repo loads the open items, works through them with
+full repo context, and ticks them off with `ki done`. The skill in
+[`skills/ki-work`](skills/ki-work/SKILL.md) does exactly that:
 
 ```sh
-ki find "certs"             # tiered search: id > tag > title > body
-ki find "auth" --graph      # follow [[wikilinks]] out and back
-ki review                   # overdue / due soon / stale, with open counts
+mkdir -p ~/.claude/skills && ln -s "$PWD/skills/ki-work" ~/.claude/skills/ki-work
 ```
 
-Drain old notes into the system:
-
-```sh
-ki import old-notes/2026-05-24.md --archive
-```
-
-Splits on date headers if present (falls back to a date in the filename), asks
-the model to cut each chunk into discrete items, previews the whole plan, and
-retires the source file to `_imported/`. Relative dates resolve against when
-the note was written, not today.
-
-Topics accrete on their own — inspect them when you're curious:
-
-```sh
-ki topics                   # every topic value, item counts, last activity
-ki topic auth-refactor      # one topic's page + items, chronological
-ki topic auth-refactor --full   # full collation, ready to pipe to an LLM
-```
-
-## Agent sessions
-
-The end-of-session flow I use with Claude Code skills: the agent distills the
-session (state, decisions, next steps) and saves it as a regular item in the
-`session` bucket, linked to a topic:
-
-```sh
-ki jot --json '{"bucket":"session","topic":"auth-refactor","title":"...","body":"..."}' -y
-```
-
-A fresh session reloads with `ki topic auth-refactor --full`. The JSON flags
-(`jot --json`, `save --json`) are the whole integration surface — any tool
-that can produce JSON and run a command can drive this, so the skills stay a
-few lines each. `ki save` writes a curated topic page (`permanent.md` +
-changelog) when a topic has earned one.
+Then inside any project repo: `/ki-work` (or "load my ki items").
 
 ## Commands
 
 | command | what it does |
 |---|---|
-| `ki init` | write config and create bucket dirs (idempotent) |
-| `ki jot "<text>"` | classify into a bucket, preview, confirm, write |
-| `ki import <path>…` | split + classify old note files into items |
-| `ki done "<id\|terms>"` | close the matching open item |
-| `ki find "<terms>"` | ranked search; `--graph`, `--topic`, `--kind`, `--json` |
-| `ki review` | overdue / due-soon / stale digest; `--topic`, `--bucket` |
-| `ki topics` | list topic values with counts and last activity |
-| `ki topic <name>` | one topic's page + items; `--full` for the collation |
-| `ki save --json <req>` | write a curated topic page |
-| `ki index [--write]` | project `_index.md` from topic-page frontmatter |
-| `ki buckets` | show the taxonomy the classifier is handed |
+| `ki init` | create the vault + config; archives a v0.7 vault first |
+| `ki bucket add <name> "<desc>"` | create a project bucket (desc feeds the LLM) |
+| `ki bucket list [--json]` | buckets with open/done counts |
+| `ki jot "<text>" -b NAME` | prepend a timestamped one-liner to the bucket log |
+| `ki dump "<text>" -b NAME` | LLM-split a braindump into a step file; preview first |
+| `ki view [-b NAME] [--done] [--full] [--json] [--days N]` | the board |
+| `ki done "<terms>" [-b NAME]` | tick the matching open item |
 
-Most commands take `--json` for machine-readable output.
-
-## Config
-
-`~/ki/.ki/config.json` — edit buckets (name, description, extra fields,
-`no_review` to keep a bucket out of digests), paths, and the classifier model.
-The classifier binary is `claude` by default; override with `$CLAUDE_BIN`.
+`jot` and `dump` read stdin when no text is given (`pbpaste | ki jot -b miso`).
+`dump` also takes `--dry-run` (print the model's JSON) and `--json PAYLOAD`
+(write a pre-made `{"title","steps"}`, skipping the model).
 
 ## Layout
 
 ```
-~/ki/.ki/config.json                   taxonomy + paths
-~/ki/jot/<bucket>/YYYY-MM-DD-slug.md   items, one file each
-~/ki/agent-artifacts/<topic>/          optional curated topic pages
-~/ki/_imported/                        originals retired by import --archive
+~/ki/.ki/config.json       buckets (name + desc) and the model
+~/ki/<bucket>/log.md       one-liners, newest first
+~/ki/<bucket>/<slug>.md    dumps, one file per braindump
 ```
+
+A log line is `- [ ] 2026-07-18 14:03 text`. Lines that don't match that
+shape are ignored by counts and preserved verbatim, so the files stay safe to
+hand-edit.
+
+## Config
+
+`~/ki/.ki/config.json` — the bucket list and the model used for `dump`
+(`haiku` by default). The model binary is `claude`; override with
+`$CLAUDE_BIN`.
 
 ## Status
 
-Works for me, daily. Interfaces may still shift. Known rough edges: the
-classifier command is hardcoded to the Claude CLI (a pluggable command template
-is planned), and content budgets in the config aren't enforced yet.
+Works for me, daily. Interfaces may still shift.

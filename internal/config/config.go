@@ -1,7 +1,8 @@
-// Package config loads and persists the ki taxonomy and paths. The config is
-// the single source of truth for buckets, directory layout, and content budgets;
-// the LLM is only ever *told* this set (it never invents buckets). Stored as JSON
-// at <root>/.ki/config.json so it needs no third-party parser.
+// Package config loads and persists the ki vault configuration. Buckets ARE
+// projects: each carries a short description that is the only context the LLM
+// gets when breaking a braindump into steps. The config is the single source of
+// truth for the bucket set and the vault root; the LLM never invents either.
+// Stored as JSON at <root>/.ki/config.json so it needs no third-party parser.
 package config
 
 import (
@@ -16,54 +17,28 @@ import (
 // ErrNotInitialized is returned by Load when no config file exists yet.
 var ErrNotInitialized = errors.New("ki not initialized (run: ki init)")
 
-// Bucket is one jot category. Fields lists extra frontmatter keys an item in
-// this bucket is expected to carry (e.g. "due" for todos). NoReview excludes
-// the bucket from `ki review` digests (session distillates are not actionable).
+// ErrLegacyVault is returned by Load when the config on disk still has the
+// v0.7 schema (type buckets + jot/threads dirs). `ki init` archives it.
+var ErrLegacyVault = errors.New("legacy v0.7 vault detected (run: ki init to archive it and start fresh)")
+
+// Bucket is one project. Desc is required at creation: it is the thin project
+// context handed to the LLM for braindump breakdown.
 type Bucket struct {
-	Name     string   `json:"name"`
-	Desc     string   `json:"desc"`
-	Fields   []string `json:"fields,omitempty"`
-	NoReview bool     `json:"no_review,omitempty"`
-}
-
-// Budgets caps generated content so artifacts stay tight.
-type Budgets struct {
-	StateWords   int `json:"state_words"`
-	DecisionLine int `json:"decision_line"`
-}
-
-// Classifier configures the model used to categorize/enrich jot captures.
-type Classifier struct {
-	Model string `json:"model"`
+	Name string `json:"name"`
+	Desc string `json:"desc"`
 }
 
 // Config is the whole ki configuration.
 type Config struct {
-	RootDir  string     `json:"root"`
-	ThreadsDir string     `json:"threads_dir"`
-	JotRoot    string     `json:"jot_root"`
-	Buckets    []Bucket   `json:"buckets"`
-	Budgets    Budgets    `json:"budgets"`
-	Classifier Classifier `json:"classifier"`
+	RootDir string   `json:"root"`
+	Model   string   `json:"model"`
+	Buckets []Bucket `json:"buckets"`
 }
 
-// Default returns the seed configuration.
+// Default returns the seed configuration: no buckets yet, they are created
+// explicitly with `ki bucket add`.
 func Default() Config {
-	return Config{
-		RootDir:  "~/ki",
-		ThreadsDir: "agent-artifacts",
-		JotRoot:    "jot",
-		Buckets: []Bucket{
-			{Name: "todo", Desc: "actionable, usually has a deadline", Fields: []string{"due"}},
-			{Name: "idea", Desc: "something to act on later, no deadline"},
-			{Name: "question", Desc: "an open question to self, needs an answer"},
-			{Name: "review", Desc: "pasted PR/review feedback; body kept verbatim"},
-			{Name: "note", Desc: "out-of-context braindump / reference"},
-			{Name: "session", Desc: "session distillate: state, decisions, next steps from a work session", Fields: []string{"topic"}, NoReview: true},
-		},
-		Budgets:    Budgets{StateWords: 120, DecisionLine: 1},
-		Classifier: Classifier{Model: "haiku"},
-	}
+	return Config{RootDir: "~/ki", Model: "haiku"}
 }
 
 func expandHome(p string) string {
@@ -92,7 +67,8 @@ func ConfigPath() string {
 	return filepath.Join(DiscoverRoot(), ".ki", "config.json")
 }
 
-// Load reads the config, returning ErrNotInitialized if it is absent.
+// Load reads the config, returning ErrNotInitialized if it is absent and
+// ErrLegacyVault if it still has the v0.7 schema.
 func Load() (Config, error) {
 	data, err := os.ReadFile(ConfigPath())
 	if err != nil {
@@ -101,6 +77,9 @@ func Load() (Config, error) {
 		}
 		return Config{}, err
 	}
+	if IsLegacyConfig(data) {
+		return Config{}, ErrLegacyVault
+	}
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", ConfigPath(), err)
@@ -108,7 +87,22 @@ func Load() (Config, error) {
 	if c.RootDir == "" {
 		c.RootDir = DiscoverRoot()
 	}
+	if c.Model == "" {
+		c.Model = "haiku"
+	}
 	return c, nil
+}
+
+// IsLegacyConfig reports whether raw config JSON has the v0.7 schema.
+func IsLegacyConfig(data []byte) bool {
+	var probe struct {
+		JotRoot    string `json:"jot_root"`
+		ThreadsDir string `json:"threads_dir"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+	return probe.JotRoot != "" || probe.ThreadsDir != ""
 }
 
 // Save writes the config as indented JSON, creating .ki/ as needed.
@@ -135,20 +129,11 @@ func (c Config) Root() string {
 	return DiscoverRoot()
 }
 
-// ThreadsPath is the artifact-threads directory.
-func (c Config) ThreadsPath() string { return filepath.Join(c.Root(), c.ThreadsDir) }
-
-// IndexPath is the thread index file.
-func (c Config) IndexPath() string { return filepath.Join(c.ThreadsPath(), "_index.md") }
-
-// ArchivePath is the retired-artifacts directory.
-func (c Config) ArchivePath() string { return filepath.Join(c.ThreadsPath(), "_archive") }
-
-// JotPath is the root of the jot buckets.
-func (c Config) JotPath() string { return filepath.Join(c.Root(), c.JotRoot) }
-
 // BucketPath is one bucket's directory.
-func (c Config) BucketPath(name string) string { return filepath.Join(c.JotPath(), name) }
+func (c Config) BucketPath(name string) string { return filepath.Join(c.Root(), name) }
+
+// LogPath is the one-liner log file inside a bucket.
+func (c Config) LogPath(name string) string { return filepath.Join(c.BucketPath(name), "log.md") }
 
 // BucketNames returns bucket names in config order.
 func (c Config) BucketNames() []string {
@@ -159,22 +144,18 @@ func (c Config) BucketNames() []string {
 	return out
 }
 
-// HasBucket reports whether name is a configured bucket.
-func (c Config) HasBucket(name string) bool {
+// FindBucket returns the named bucket, or false if it is not configured.
+func (c Config) FindBucket(name string) (Bucket, bool) {
 	for _, b := range c.Buckets {
 		if b.Name == name {
-			return true
+			return b, true
 		}
 	}
-	return false
+	return Bucket{}, false
 }
 
-// BucketNoReview reports whether the named bucket is excluded from review digests.
-func (c Config) BucketNoReview(name string) bool {
-	for _, b := range c.Buckets {
-		if b.Name == name {
-			return b.NoReview
-		}
-	}
-	return false
+// HasBucket reports whether name is a configured bucket.
+func (c Config) HasBucket(name string) bool {
+	_, ok := c.FindBucket(name)
+	return ok
 }

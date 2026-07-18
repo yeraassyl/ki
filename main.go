@@ -1,7 +1,8 @@
-// Command ki is the deterministic backbone of the artifact/braindump system:
-// it owns paths, config, the bucket taxonomy, index projection, capture, and (in
-// later phases) search and artifact upsert. The LLM produces content; this binary
-// places it. See README.md for the phase roadmap.
+// Command ki is the deterministic backbone of a small work vault: buckets ARE
+// projects, and everything captured is an action item. One-liners land in a
+// per-bucket log; braindumps are split by an LLM into step files. The LLM only
+// ever produces content (titles, steps); this binary owns every path, name,
+// and byte on disk. See README.md.
 package main
 
 import (
@@ -13,17 +14,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"regexp"
 	"strings"
 	"time"
 
-	"ki/internal/classify"
+	"ki/internal/breakdown"
 	"ki/internal/config"
-	"ki/internal/search"
-	"ki/internal/store"
+	"ki/internal/vault"
+	"ki/internal/view"
 )
 
-const version = "0.7.0"
+const version = "0.8.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -35,26 +36,16 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		err = cmdInit(args)
-	case "buckets":
-		err = cmdBuckets(args)
-	case "index":
-		err = cmdIndex(args)
+	case "bucket":
+		err = cmdBucket(args)
 	case "jot":
 		err = cmdJot(args)
-	case "find":
-		err = cmdFind(args)
+	case "dump":
+		err = cmdDump(args)
+	case "view":
+		err = cmdView(args)
 	case "done":
 		err = cmdDone(args)
-	case "import":
-		err = cmdImport(args)
-	case "topics":
-		err = cmdTopics(args)
-	case "topic":
-		err = cmdTopic(args)
-	case "save":
-		err = cmdSave(args)
-	case "review":
-		err = cmdReview(args)
 	case "version", "-v", "--version":
 		fmt.Println("ki " + version)
 	case "help", "-h", "--help":
@@ -71,159 +62,39 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `ki — artifact + braindump backbone
+	fmt.Fprint(os.Stderr, `ki — buckets are projects; everything is an action item
 
 usage: ki <command> [flags]
 
 commands:
-  init                 create config (~/ki/.ki/config.json) and bucket dirs
-  buckets [--json]     print the current bucket taxonomy
-  jot "<text>"         classify a note into a bucket, preview, confirm, write
-  import <path>        split + classify a braindump file (or folder) into items
-  done "<id|terms>"    close the matching open item (status: done)
-  find "<terms>"       tiered search across items, topics, and notes
-  review [--overdue]   surface open items that are overdue, due soon, or stale
-  topics [--json]      list topic values: item counts, last activity, page?
-  topic <name>         show a topic's page + items; --full prints collation
-  index [--write]      project _index.md from topic-page frontmatter
-  save --json <req>    write a topic page (permanent.md + changelog + index)
+  init                        create the vault and config; archives a v0.7 vault first
+  bucket add <name> "<desc>"  create a project bucket (desc is the LLM's only context)
+  bucket list [--json]        list buckets with open/done counts
+  jot "<text>" -b NAME        prepend a timestamped one-liner to the bucket log (no LLM)
+  dump "<text>" -b NAME       LLM-split a braindump into a titled step file; preview first
+  view [-b NAME] [flags]      board: fresh | aging one-liners + dump progress per bucket
+  done "<terms>" [-b NAME]    tick the matching open item (log line or dump step)
   version | help
 
-jot flags:
-  -b, --bucket NAME    skip the classifier and file directly into NAME
-      --due DATE       set/override due date (YYYY-MM-DD)
-      --topic NAME     set/override linked topic
-      --tag TAG        add a tag (repeatable)
-      --json PAYLOAD   write a pre-made Classification JSON (for skills)
-      --dry-run        classify and print JSON, write nothing
-  -y, --yes            skip the confirm prompt
+jot/dump read stdin when no text is given (pbpaste | ki jot -b miso).
 
-import flags:
-  --dry-run            classify and print the item plan as JSON, write nothing
-  -y, --yes            write everything without confirming
-  -b, --bucket NAME    skip the classifier; one item per chunk into NAME
-  --archive            move the source file(s) to _imported/ after writing
+dump flags:
+  -y, --yes        save without the preview prompt
+  --dry-run        print the model's JSON, write nothing
+  --json PAYLOAD   write a pre-made {"title","steps"} JSON (skips the model)
 
-find/review also take --topic NAME to restrict to one topic.
+view flags:
+  --all     all buckets (default when -b is absent)
+  --done    include done one-liners
+  --full    print raw log + dump files (pipe this to an agent)
+  --json    machine-readable board
+  --days N  fresh/aging boundary in days (default 7)
 `)
-}
-
-func cmdInit(args []string) error {
-	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	force := fs.Bool("force", false, "overwrite an existing config with defaults")
-	_ = fs.Parse(args)
-
-	cfg, err := config.Load()
-	switch {
-	case err == config.ErrNotInitialized || *force:
-		cfg = config.Default()
-		if e := config.Save(cfg); e != nil {
-			return e
-		}
-		fmt.Println("wrote", config.ConfigPath())
-	case err != nil:
-		return err
-	default:
-		fmt.Println("config already exists:", config.ConfigPath(), "(use --force to reset)")
-	}
-
-	dirs := []string{cfg.ThreadsPath(), cfg.JotPath()}
-	for _, b := range cfg.Buckets {
-		dirs = append(dirs, cfg.BucketPath(b.Name))
-	}
-	for _, d := range dirs {
-		if e := os.MkdirAll(d, 0o755); e != nil {
-			return e
-		}
-	}
-	fmt.Printf("ki ready at %s\n  threads: %s/\n  jot:     %s/ (%s)\n",
-		cfg.Root(), cfg.ThreadsDir, cfg.JotRoot, strings.Join(cfg.BucketNames(), ", "))
-	return nil
-}
-
-func cmdBuckets(args []string) error {
-	fs := flag.NewFlagSet("buckets", flag.ExitOnError)
-	asJSON := fs.Bool("json", false, "output as JSON")
-	_ = fs.Parse(args)
-
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(cfg.Buckets)
-	}
-	for _, b := range cfg.Buckets {
-		extra := ""
-		if len(b.Fields) > 0 {
-			extra = "  [fields: " + strings.Join(b.Fields, ", ") + "]"
-		}
-		fmt.Printf("%-10s %s%s\n", b.Name, b.Desc, extra)
-	}
-	return nil
-}
-
-func cmdIndex(args []string) error {
-	fs := flag.NewFlagSet("index", flag.ExitOnError)
-	write := fs.Bool("write", false, "write _index.md (backs up existing to _index.md.bak)")
-	force := fs.Bool("force", false, "allow --write even when some hooks were derived")
-	_ = fs.Parse(args)
-
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	threads, err := store.ScanThreads(cfg)
-	if err != nil {
-		return err
-	}
-	standalones, err := store.ScanStandalones(cfg)
-	if err != nil {
-		return err
-	}
-	rendered := store.RenderIndex(threads, standalones, store.CountArchive(cfg))
-	derived := store.CountDerivedHooks(threads)
-
-	if !*write {
-		fmt.Print(rendered)
-		fmt.Fprintf(os.Stderr, "\n[dry-run] %d threads, %d standalone, %d derived hook(s). Run with --write to save.\n",
-			len(threads), len(standalones), derived)
-		if derived > 0 {
-			fmt.Fprintln(os.Stderr, "[warn] derived hooks won't match your curated ones; add `hook:` frontmatter (P3) before --write, or pass --force.")
-		}
-		return nil
-	}
-	if derived > 0 && !*force {
-		return fmt.Errorf("%d thread(s) have derived hooks; refusing to overwrite a curated _index.md — re-run with --force to write anyway", derived)
-	}
-
-	idx := cfg.IndexPath()
-	if data, e := os.ReadFile(idx); e == nil {
-		if e := os.WriteFile(idx+".bak", data, 0o644); e != nil {
-			return e
-		}
-	}
-	if e := os.WriteFile(idx, []byte(rendered), 0o644); e != nil {
-		return e
-	}
-	fmt.Printf("wrote %s (backup: %s.bak)\n", idx, idx)
-	return nil
-}
-
-// multiFlag collects a repeatable string flag.
-type multiFlag []string
-
-func (m *multiFlag) String() string { return strings.Join(*m, ",") }
-func (m *multiFlag) Set(v string) error {
-	*m = append(*m, v)
-	return nil
 }
 
 // parseMixed parses args allowing flags before AND after positionals (stdlib
 // flag stops at the first positional, which silently drops trailing flags like
-// `ki import file.md -y`). Returns the positional arguments.
+// `ki jot "text" -b miso`). Returns the positional arguments.
 func parseMixed(fs *flag.FlagSet, args []string) []string {
 	var pos []string
 	_ = fs.Parse(args)
@@ -235,84 +106,291 @@ func parseMixed(fs *flag.FlagSet, args []string) []string {
 	return pos
 }
 
+func relToRoot(c config.Config, path string) string {
+	if r, err := filepath.Rel(c.Root(), path); err == nil {
+		return r
+	}
+	return path
+}
+
+// textFromArgsOrStdin joins positional text, falling back to piped stdin.
+func textFromArgsOrStdin(pos []string) string {
+	input := strings.TrimSpace(strings.Join(pos, " "))
+	if input == "" {
+		if data, e := io.ReadAll(os.Stdin); e == nil {
+			input = strings.TrimSpace(string(data))
+		}
+	}
+	return input
+}
+
+func requireBucket(c config.Config, name string) (config.Bucket, error) {
+	configured := strings.Join(c.BucketNames(), ", ")
+	if configured == "" {
+		configured = "none yet"
+	}
+	if name == "" {
+		return config.Bucket{}, fmt.Errorf("bucket required: pass -b <name> (configured: %s)", configured)
+	}
+	b, ok := c.FindBucket(name)
+	if !ok {
+		return config.Bucket{}, fmt.Errorf("unknown bucket %q (configured: %s) — create it: ki bucket add %s \"<desc>\"", name, configured, name)
+	}
+	return b, nil
+}
+
+// ---- init ----
+
+// legacyVaultAt reports whether root holds a v0.7 vault (old config schema or
+// a jot/ directory) that should be archived before a fresh init.
+func legacyVaultAt(root string) bool {
+	if data, err := os.ReadFile(filepath.Join(root, ".ki", "config.json")); err == nil && config.IsLegacyConfig(data) {
+		return true
+	}
+	if fi, err := os.Stat(filepath.Join(root, "jot")); err == nil && fi.IsDir() {
+		return true
+	}
+	return false
+}
+
+func cmdInit(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "archive a legacy vault without asking")
+	fs.BoolVar(yes, "y", false, "shorthand for --yes")
+	_ = fs.Parse(args)
+
+	cfg, err := config.Load()
+	root := config.DiscoverRoot()
+
+	if err == nil {
+		for _, b := range cfg.Buckets {
+			if e := os.MkdirAll(cfg.BucketPath(b.Name), 0o755); e != nil {
+				return e
+			}
+		}
+		fmt.Printf("ki ready at %s (buckets: %s)\n", cfg.Root(), bucketsOrHint(cfg))
+		return nil
+	}
+
+	if err == config.ErrLegacyVault || (err == config.ErrNotInitialized && legacyVaultAt(root)) {
+		archive := root + "-archive"
+		if _, e := os.Stat(archive); e == nil {
+			return fmt.Errorf("cannot archive: %s already exists — move it away first", archive)
+		}
+		fmt.Printf("legacy v0.7 vault at %s\nit will be renamed to %s and a fresh vault created\n", root, archive)
+		if !*yes {
+			fmt.Print("proceed? [y/N] > ")
+			line, e := bufio.NewReader(os.Stdin).ReadString('\n')
+			if e != nil && line == "" {
+				fmt.Println()
+				return nil
+			}
+			if s := strings.ToLower(strings.TrimSpace(line)); s != "y" && s != "yes" {
+				fmt.Println("cancelled")
+				return nil
+			}
+		}
+		if e := os.Rename(root, archive); e != nil {
+			return e
+		}
+		fmt.Printf("archived → %s\n", archive)
+	} else if err != config.ErrNotInitialized {
+		return err
+	}
+
+	if e := config.Save(config.Default()); e != nil {
+		return e
+	}
+	fmt.Printf("wrote %s\n", config.ConfigPath())
+	fmt.Printf("ki ready at %s — add a project: ki bucket add <name> \"<one-line description>\"\n", root)
+	return nil
+}
+
+func bucketsOrHint(c config.Config) string {
+	if len(c.Buckets) == 0 {
+		return "none — add one: ki bucket add <name> \"<desc>\""
+	}
+	return strings.Join(c.BucketNames(), ", ")
+}
+
+// ---- bucket ----
+
+var bucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+func cmdBucket(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: ki bucket add <name> \"<desc>\" | ki bucket list [--json]")
+	}
+	switch args[0] {
+	case "add":
+		return cmdBucketAdd(args[1:])
+	case "list", "ls":
+		return cmdBucketList(args[1:])
+	default:
+		return fmt.Errorf("unknown bucket subcommand %q (add, list)", args[0])
+	}
+}
+
+func cmdBucketAdd(args []string) error {
+	fs := flag.NewFlagSet("bucket add", flag.ExitOnError)
+	pos := parseMixed(fs, args)
+	if len(pos) < 2 {
+		return fmt.Errorf(`usage: ki bucket add <name> "<one-line description>" — the desc is the LLM's only project context`)
+	}
+	name := pos[0]
+	desc := strings.TrimSpace(strings.Join(pos[1:], " "))
+	if !bucketNameRe.MatchString(name) {
+		return fmt.Errorf("bucket name %q must be lowercase letters, digits, and dashes", name)
+	}
+	if desc == "" {
+		return fmt.Errorf("a description is required — the LLM uses it to break down braindumps")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if cfg.HasBucket(name) {
+		return fmt.Errorf("bucket %q already exists", name)
+	}
+	cfg.Buckets = append(cfg.Buckets, config.Bucket{Name: name, Desc: desc})
+	if err := config.Save(cfg); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(cfg.BucketPath(name), 0o755); err != nil {
+		return err
+	}
+	logPath := cfg.LogPath(name)
+	if _, err := os.Stat(logPath); os.IsNotExist(err) {
+		if e := os.WriteFile(logPath, nil, 0o644); e != nil {
+			return e
+		}
+	}
+	fmt.Printf("bucket %q ready → %s/\n", name, relToRoot(cfg, cfg.BucketPath(name)))
+	return nil
+}
+
+func cmdBucketList(args []string) error {
+	fs := flag.NewFlagSet("bucket list", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "output JSON")
+	_ = fs.Parse(args)
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	type row struct {
+		Name string `json:"name"`
+		Desc string `json:"desc"`
+		Open int    `json:"open"`
+		Done int    `json:"done"`
+	}
+	rows := make([]row, 0, len(cfg.Buckets))
+	for _, b := range cfg.Buckets {
+		bd, e := vault.ScanBucket(cfg, b)
+		if e != nil {
+			return e
+		}
+		open, done := bd.Counts()
+		rows = append(rows, row{Name: b.Name, Desc: b.Desc, Open: open, Done: done})
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rows)
+	}
+	if len(rows) == 0 {
+		fmt.Println("no buckets yet — add one: ki bucket add <name> \"<desc>\"")
+		return nil
+	}
+	for _, r := range rows {
+		fmt.Printf("%-14s %s  (%d open / %d done)\n", r.Name, r.Desc, r.Open, r.Done)
+	}
+	return nil
+}
+
+// ---- jot ----
+
 func cmdJot(args []string) error {
 	fs := flag.NewFlagSet("jot", flag.ExitOnError)
-	bucket := fs.String("bucket", "", "bucket name; skips the classifier")
+	bucket := fs.String("bucket", "", "bucket to jot into")
 	fs.StringVar(bucket, "b", "", "shorthand for --bucket")
-	due := fs.String("due", "", "due date YYYY-MM-DD (override)")
-	topic := fs.String("topic", "", "link to a topic (override)")
-	var tags multiFlag
-	fs.Var(&tags, "tag", "tag (repeatable, override)")
-	jsonPayload := fs.String("json", "", "write a pre-made Classification JSON (skips classifier)")
-	filePayload := fs.String("file", "", "read a Classification JSON from a file (skips classifier)")
-	yes := fs.Bool("yes", false, "skip the confirm prompt")
-	fs.BoolVar(yes, "y", false, "shorthand for --yes")
-	dryRun := fs.Bool("dry-run", false, "classify and print JSON, write nothing")
 	pos := parseMixed(fs, args)
 
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
+	b, err := requireBucket(cfg, *bucket)
+	if err != nil {
+		return err
+	}
+	text := strings.Join(strings.Fields(textFromArgsOrStdin(pos)), " ")
+	if text == "" {
+		return fmt.Errorf("nothing to jot (pass text or pipe stdin)")
+	}
+	l, err := vault.LoadLog(cfg.LogPath(b.Name))
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	l.Prepend(now.Format("2006-01-02"), now.Format("15:04"), text)
+	if err := l.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("jotted → %s\n", relToRoot(cfg, l.Path))
+	return nil
+}
+
+// ---- dump ----
+
+func cmdDump(args []string) error {
+	fs := flag.NewFlagSet("dump", flag.ExitOnError)
+	bucket := fs.String("bucket", "", "bucket to dump into")
+	fs.StringVar(bucket, "b", "", "shorthand for --bucket")
+	yes := fs.Bool("yes", false, "skip the confirm prompt")
+	fs.BoolVar(yes, "y", false, "shorthand for --yes")
+	dryRun := fs.Bool("dry-run", false, "print the model's JSON, write nothing")
+	jsonPayload := fs.String("json", "", "write a pre-made {\"title\",\"steps\"} JSON (skips the model)")
+	pos := parseMixed(fs, args)
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	b, err := requireBucket(cfg, *bucket)
+	if err != nil {
+		return err
+	}
 	today := time.Now().Format("2006-01-02")
 
-	payload := *jsonPayload
-	if payload == "" && *filePayload != "" {
-		data, e := os.ReadFile(*filePayload)
-		if e != nil {
-			return e
+	var bd breakdown.Breakdown
+	if *jsonPayload != "" {
+		bd, err = breakdown.Parse(*jsonPayload)
+		if err != nil {
+			return err
 		}
-		payload = string(data)
-	}
-
-	input := strings.TrimSpace(strings.Join(pos, " "))
-	if input == "" && payload == "" {
-		if data, e := io.ReadAll(os.Stdin); e == nil {
-			input = strings.TrimSpace(string(data))
+		if bd.Title == "" || len(bd.Steps) == 0 {
+			return fmt.Errorf("dump --json needs a non-empty title and steps")
 		}
-	}
-
-	var cl store.Classification
-	switch {
-	case payload != "":
-		if e := json.Unmarshal([]byte(payload), &cl); e != nil {
-			return fmt.Errorf("parse jot JSON: %w", e)
+	} else {
+		text := textFromArgsOrStdin(pos)
+		if text == "" {
+			return fmt.Errorf("nothing to dump (pass text or pipe stdin)")
 		}
-	case *bucket != "":
-		if !cfg.HasBucket(*bucket) {
-			return fmt.Errorf("unknown bucket %q (configured: %s)", *bucket, strings.Join(cfg.BucketNames(), ", "))
-		}
-		cl = store.Classification{Bucket: *bucket, Title: store.FirstLine(input), Body: input}
-	default:
-		if input == "" {
-			return fmt.Errorf("nothing to capture (pass text, pipe stdin, or use --json)")
-		}
-		cl, err = classify.Classify(cfg, input, store.TopicNames(cfg), today)
+		bd, err = breakdown.Run(cfg, b, text)
 		if err != nil {
 			return err
 		}
 	}
 
-	if *due != "" {
-		cl.Due = *due
-	}
-	if *topic != "" {
-		cl.Topic = *topic
-	}
-	if len(tags) > 0 {
-		cl.Tags = []string(tags)
-	}
-
 	if *dryRun {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(cl)
+		return enc.Encode(bd)
 	}
 
-	it := store.NewItem(cl, today, sourceOf(payload, *bucket))
-
 	if !*yes {
-		ok, e := confirm(cfg, &it)
+		ok, e := confirmDump(cfg, b.Name, today, &bd)
 		if e != nil {
 			return e
 		}
@@ -322,34 +400,20 @@ func cmdJot(args []string) error {
 		}
 	}
 
-	path, err := store.WriteItem(cfg, it)
+	path, err := vault.WriteDump(cfg.BucketPath(b.Name), bd.Title, today, bd.Steps)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("saved → %s  [%s]\n", relToRoot(cfg, path), it.Type)
+	fmt.Printf("saved → %s  (%d steps)\n", relToRoot(cfg, path), len(bd.Steps))
 	return nil
 }
 
-func sourceOf(jsonPayload, bucket string) string {
-	if bucket != "" && jsonPayload == "" {
-		return "manual"
-	}
-	return "jot"
-}
-
-func relToRoot(c config.Config, path string) string {
-	if r, err := filepath.Rel(c.Root(), path); err == nil {
-		return r
-	}
-	return path
-}
-
-// confirm previews the item and runs the y/e/b/n loop against stdin.
-func confirm(cfg config.Config, it *store.Item) (bool, error) {
+// confirmDump previews the dump and runs the y/e/n loop against stdin.
+func confirmDump(cfg config.Config, bucketName, today string, bd *breakdown.Breakdown) (bool, error) {
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		printPreview(cfg, *it)
-		fmt.Print("[Y] save  [e] edit  [b] bucket  [n] cancel > ")
+		printDumpPreview(cfg, bucketName, *bd)
+		fmt.Print("[Y] save  [e] edit  [n] cancel > ")
 		line, err := reader.ReadString('\n')
 		if err != nil && line == "" {
 			// No TTY / EOF: don't write silently.
@@ -361,69 +425,42 @@ func confirm(cfg config.Config, it *store.Item) (bool, error) {
 			return true, nil
 		case "n", "no", "q":
 			return false, nil
-		case "b", "bucket":
-			pickBucket(cfg, reader, it)
 		case "e", "edit":
-			if e := editItem(it); e != nil {
+			if e := editDump(today, bd); e != nil {
 				fmt.Fprintln(os.Stderr, "edit failed:", e)
 			}
 		default:
-			fmt.Println("  (choose y, e, b, or n)")
+			fmt.Println("  (choose y, e, or n)")
 		}
 	}
 }
 
-func printPreview(cfg config.Config, it store.Item) {
+func printDumpPreview(cfg config.Config, bucketName string, bd breakdown.Breakdown) {
 	fmt.Println()
-	fmt.Println("┌─ proposed capture ───────────────────────────")
-	fmt.Printf("│ bucket : %s\n", it.Type)
-	fmt.Printf("│ title  : %s\n", it.Title)
-	if it.Due != "" {
-		fmt.Printf("│ due    : %s\n", it.Due)
-	}
-	if it.Topic != "" {
-		fmt.Printf("│ topic  : %s\n", it.Topic)
-	}
-	if len(it.Tags) > 0 {
-		fmt.Printf("│ tags   : %s\n", strings.Join(it.Tags, ", "))
-	}
-	fmt.Printf("│ file   : %s\n", filepath.Join(cfg.JotRoot, it.Type, it.ID+".md"))
-	if strings.TrimSpace(it.Body) != "" && it.Body != it.Title {
-		fmt.Println("│ body   :")
-		for _, ln := range strings.Split(strings.TrimRight(it.Body, "\n"), "\n") {
-			fmt.Printf("│   %s\n", ln)
-		}
+	fmt.Println("┌─ proposed dump ──────────────────────────────")
+	fmt.Printf("│ bucket : %s\n", bucketName)
+	fmt.Printf("│ file   : %s\n", filepath.Join(bucketName, vault.Slug(bd.Title)+".md"))
+	fmt.Printf("│ title  : %s\n", bd.Title)
+	fmt.Println("│ steps  :")
+	for _, s := range bd.Steps {
+		fmt.Printf("│   - [ ] %s\n", s)
 	}
 	fmt.Println("└──────────────────────────────────────────────")
 }
 
-func pickBucket(cfg config.Config, r *bufio.Reader, it *store.Item) {
-	fmt.Println("  buckets:", strings.Join(cfg.BucketNames(), ", "))
-	fmt.Print("  bucket > ")
-	line, _ := r.ReadString('\n')
-	name := strings.TrimSpace(line)
-	if name == "" {
-		return
-	}
-	if !cfg.HasBucket(name) {
-		fmt.Println("  unknown bucket:", name)
-		return
-	}
-	it.Type = name
-}
-
-func editItem(it *store.Item) error {
+// editDump opens the rendered dump in $EDITOR and parses the result back.
+func editDump(today string, bd *breakdown.Breakdown) error {
 	ed := os.Getenv("EDITOR")
 	if ed == "" {
 		ed = "vi"
 	}
-	tmp, err := os.CreateTemp("", "ki-jot-*.md")
+	tmp, err := os.CreateTemp("", "ki-dump-*.md")
 	if err != nil {
 		return err
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
-	if _, err := tmp.WriteString(it.Render()); err != nil {
+	if _, err := tmp.WriteString(vault.RenderDump(bd.Title, today, bd.Steps)); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -434,235 +471,189 @@ func editItem(it *store.Item) error {
 	if err := cmd.Run(); err != nil {
 		return err
 	}
-	data, err := os.ReadFile(tmpPath)
+	d, err := vault.LoadDump(tmpPath)
 	if err != nil {
 		return err
 	}
-	parsed, err := store.ParseItem(data)
-	if err != nil {
-		return err
+	steps := make([]string, 0, len(d.Steps))
+	for _, s := range d.Steps {
+		steps = append(steps, s.Text)
 	}
-	*it = parsed
+	if len(steps) == 0 {
+		return fmt.Errorf("edited dump has no `- [ ]` steps")
+	}
+	bd.Title, bd.Steps = d.Title, steps
 	return nil
 }
 
-func cmdFind(args []string) error {
-	fs := flag.NewFlagSet("find", flag.ExitOnError)
-	limit := fs.Int("limit", 10, "max results")
-	graph := fs.Bool("graph", false, "expand top hits with [[linked]] neighbours")
-	all := fs.Bool("all", false, "include _archive, changelogs, and backups")
+// ---- view ----
+
+func cmdView(args []string) error {
+	fs := flag.NewFlagSet("view", flag.ExitOnError)
+	bucket := fs.String("bucket", "", "one bucket only")
+	fs.StringVar(bucket, "b", "", "shorthand for --bucket")
+	all := fs.Bool("all", false, "all buckets (default when -b is absent)")
+	showDone := fs.Bool("done", false, "include done one-liners")
+	full := fs.Bool("full", false, "print raw log + dump files")
 	asJSON := fs.Bool("json", false, "output JSON")
-	topic := fs.String("topic", "", "restrict to docs carrying this topic")
-	var kinds multiFlag
-	fs.Var(&kinds, "kind", "restrict to kind: thread|standalone|jot|note (repeatable)")
-	pos := parseMixed(fs, args)
-
-	query := strings.TrimSpace(strings.Join(pos, " "))
-	if query == "" {
-		return fmt.Errorf(`usage: ki find "<terms>"`)
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	hits, err := search.Find(cfg, query, search.Options{
-		Limit: *limit, Graph: *graph, IncludeAll: *all, Kinds: []string(kinds), Topic: *topic,
-	})
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(hits)
-	}
-	if len(hits) == 0 {
-		fmt.Println("no matches")
-		return nil
-	}
-	for i, h := range hits {
-		fmt.Printf("%2d. [%s] %s  (score %d)\n", i+1, h.Kind, h.Title, h.Score)
-		fmt.Printf("    %s\n", h.Path)
-		if len(h.Reasons) > 0 {
-			fmt.Printf("    ↳ %s\n", strings.Join(h.Reasons, ", "))
-		}
-		if h.Excerpt != "" {
-			fmt.Printf("    … %s\n", h.Excerpt)
-		}
-	}
-	return nil
-}
-
-func cmdSave(args []string) error {
-	fs := flag.NewFlagSet("save", flag.ExitOnError)
-	jsonPayload := fs.String("json", "", "SaveRequest JSON")
-	filePayload := fs.String("file", "", "read SaveRequest JSON from a file")
-	dryRun := fs.Bool("dry-run", false, "render and print, write nothing")
+	days := fs.Int("days", 7, "fresh/aging boundary in days")
 	_ = fs.Parse(args)
+	_ = all // --all is the default; the flag exists so the invocation reads naturally
 
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	today := time.Now().Format("2006-01-02")
-
-	raw := *jsonPayload
-	if raw == "" && *filePayload != "" {
-		data, e := os.ReadFile(*filePayload)
+	buckets := cfg.Buckets
+	if *bucket != "" {
+		b, e := requireBucket(cfg, *bucket)
 		if e != nil {
 			return e
 		}
-		raw = string(data)
+		buckets = []config.Bucket{b}
 	}
-	if raw == "" {
-		data, _ := io.ReadAll(os.Stdin)
-		raw = string(data)
-	}
-	if len(strings.TrimSpace(raw)) == 0 {
-		return fmt.Errorf("save: provide a SaveRequest via --json, --file, or stdin")
-	}
-	var req store.SaveRequest
-	if e := json.Unmarshal([]byte(raw), &req); e != nil {
-		return fmt.Errorf("parse save JSON: %w", e)
-	}
-
-	res, err := store.Save(cfg, req, today, *dryRun)
-	if err != nil {
-		return err
-	}
-
-	if *dryRun {
-		newTag := ""
-		if res.Created {
-			newTag = " (new thread)"
-		}
-		fmt.Printf("--- permanent.md (dry-run)%s ---\n", newTag)
-		fmt.Print(res.Permanent)
-		fmt.Printf("\n--- target: %s ---\n", relToRoot(cfg, res.PermanentPath))
-		if strings.TrimSpace(req.Changelog) != "" {
-			fmt.Printf("changelog += %s: %s\n", today, strings.TrimSpace(req.Changelog))
-		}
-		fmt.Println("index would be rebuilt.")
+	if len(buckets) == 0 {
+		fmt.Println("no buckets yet — add one: ki bucket add <name> \"<desc>\"")
 		return nil
 	}
 
-	verb := "updated"
-	if res.Created {
-		verb = "created"
+	if *full {
+		return printFull(cfg, buckets)
 	}
-	fmt.Printf("%s thread %q → %s\n", verb, res.Thread, relToRoot(cfg, res.PermanentPath))
-	fmt.Printf("  changelog: %s\n  index:     %s\n", relToRoot(cfg, res.ChangelogPath), relToRoot(cfg, res.IndexPath))
-	return nil
-}
 
-func cmdReview(args []string) error {
-	fs := flag.NewFlagSet("review", flag.ExitOnError)
-	overdue := fs.Bool("overdue", false, "only overdue items")
-	stale := fs.Int("stale", 14, "stale threshold in days (items with no due date)")
-	soon := fs.Int("soon", 7, "due-soon window in days")
-	bucket := fs.String("bucket", "", "restrict to one bucket")
-	topic := fs.String("topic", "", "restrict to one topic")
-	asJSON := fs.Bool("json", false, "output JSON")
-	_ = fs.Parse(args)
-
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	rev, err := store.Digest(cfg, store.ReviewOptions{
-		StaleDays: *stale, SoonDays: *soon, Bucket: *bucket, Topic: *topic, OnlyOverdue: *overdue,
-	}, time.Now())
+	board, err := view.Build(cfg, buckets, time.Now())
 	if err != nil {
 		return err
 	}
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(rev)
+		return enc.Encode(board)
 	}
-	printReview(rev)
+	fmt.Print(view.Render(board, view.Options{Days: *days, ShowDone: *showDone}))
 	return nil
 }
 
-func printReview(rev store.Review) {
-	if len(rev.Overdue)+len(rev.DueSoon)+len(rev.Stale) == 0 {
-		fmt.Println("clear — nothing overdue, due soon, or stale.")
-	}
-	if len(rev.Overdue) > 0 {
-		fmt.Printf("overdue (%d):\n", len(rev.Overdue))
-		for _, r := range rev.Overdue {
-			fmt.Printf("  [%s] %s  (%dd overdue, due %s)\n        %s\n", r.Type, r.Title, -r.DueInDays, r.Due, r.Path)
+// printFull dumps the raw files of each bucket — the collation to pipe into
+// an agent session.
+func printFull(cfg config.Config, buckets []config.Bucket) error {
+	for _, b := range buckets {
+		fmt.Printf("## %s — %s\n", b.Name, b.Desc)
+		paths := []string{cfg.LogPath(b.Name)}
+		bd, err := vault.ScanBucket(cfg, b)
+		if err != nil {
+			return err
+		}
+		for _, d := range bd.Dumps {
+			paths = append(paths, d.Path)
+		}
+		for _, p := range paths {
+			data, err := os.ReadFile(p)
+			if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+				continue
+			}
+			fmt.Printf("===== %s =====\n%s\n", relToRoot(cfg, p), strings.TrimRight(string(data), "\n"))
 		}
 	}
-	if len(rev.DueSoon) > 0 {
-		fmt.Printf("due soon (%d):\n", len(rev.DueSoon))
-		for _, r := range rev.DueSoon {
-			fmt.Printf("  [%s] %s  (in %dd, due %s)\n        %s\n", r.Type, r.Title, r.DueInDays, r.Due, r.Path)
-		}
-	}
-	if len(rev.Stale) > 0 {
-		fmt.Printf("stale (%d):\n", len(rev.Stale))
-		for _, r := range rev.Stale {
-			fmt.Printf("  [%s] %s  (%dd old)\n        %s\n", r.Type, r.Title, r.AgeDays, r.Path)
-		}
-	}
-	if len(rev.Counts) > 0 {
-		keys := make([]string, 0, len(rev.Counts))
-		for k := range rev.Counts {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		parts := make([]string, 0, len(keys))
-		for _, k := range keys {
-			parts = append(parts, fmt.Sprintf("%s %d", k, rev.Counts[k]))
-		}
-		fmt.Println("open items:", strings.Join(parts, ", "))
-	}
+	return nil
+}
+
+// ---- done ----
+
+// candidate is one open item `ki done` could tick: a log entry or a dump step.
+type candidate struct {
+	bucket string
+	label  string // human-readable: text plus dump title context
+	hay    string // lowercase match target
+	path   string
+	tick   func() error
 }
 
 func cmdDone(args []string) error {
 	fs := flag.NewFlagSet("done", flag.ExitOnError)
+	bucket := fs.String("bucket", "", "restrict to one bucket")
+	fs.StringVar(bucket, "b", "", "shorthand for --bucket")
 	pos := parseMixed(fs, args)
 	terms := strings.TrimSpace(strings.Join(pos, " "))
 	if terms == "" {
-		return fmt.Errorf(`usage: ki done "<id or title terms>"`)
+		return fmt.Errorf(`usage: ki done "<terms>" [-b <bucket>]`)
 	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	items, err := store.ScanItems(cfg)
-	if err != nil {
-		return err
+	buckets := cfg.Buckets
+	if *bucket != "" {
+		b, e := requireBucket(cfg, *bucket)
+		if e != nil {
+			return e
+		}
+		buckets = []config.Bucket{b}
 	}
-	var open []store.Item
-	for _, it := range items {
-		if it.Status == "" || it.Status == "open" {
-			open = append(open, it)
+
+	var cands []candidate
+	for _, b := range buckets {
+		bd, e := vault.ScanBucket(cfg, b)
+		if e != nil {
+			return e
+		}
+		log := bd.Log
+		for _, entry := range log.Entries {
+			if entry.Done {
+				continue
+			}
+			line := entry.Line
+			l := log // copy per closure; Lines slice is shared, Save writes the file
+			cands = append(cands, candidate{
+				bucket: b.Name,
+				label:  entry.Text,
+				hay:    strings.ToLower(entry.Text),
+				path:   log.Path,
+				tick: func() error {
+					if err := l.Tick(line); err != nil {
+						return err
+					}
+					return l.Save()
+				},
+			})
+		}
+		for i := range bd.Dumps {
+			d := bd.Dumps[i]
+			for _, step := range d.Steps {
+				if step.Done {
+					continue
+				}
+				line := step.Line
+				dd := d
+				cands = append(cands, candidate{
+					bucket: b.Name,
+					label:  step.Text + "  (dump: " + d.Title + ")",
+					hay:    strings.ToLower(d.Title + " " + step.Text),
+					path:   d.Path,
+					tick: func() error {
+						if err := dd.Tick(line); err != nil {
+							return err
+						}
+						return dd.Save()
+					},
+				})
+			}
 		}
 	}
 
-	var matches []store.Item
-	for _, it := range open {
-		if it.ID == terms {
-			matches = []store.Item{it}
-			break
+	toks := strings.Fields(strings.ToLower(terms))
+	var matches []candidate
+	for _, c := range cands {
+		all := true
+		for _, t := range toks {
+			if !strings.Contains(c.hay, t) {
+				all = false
+				break
+			}
 		}
-	}
-	if len(matches) == 0 {
-		toks := strings.Fields(strings.ToLower(terms))
-		for _, it := range open {
-			hay := strings.ToLower(it.ID + " " + it.Title)
-			all := true
-			for _, t := range toks {
-				if !strings.Contains(hay, t) {
-					all = false
-					break
-				}
-			}
-			if all {
-				matches = append(matches, it)
-			}
+		if all {
+			matches = append(matches, c)
 		}
 	}
 
@@ -670,306 +661,16 @@ func cmdDone(args []string) error {
 	case 0:
 		return fmt.Errorf("no open item matches %q", terms)
 	case 1:
-		it, err := store.CloseItem(matches[0].Path, time.Now().Format("2006-01-02"))
-		if err != nil {
+		if err := matches[0].tick(); err != nil {
 			return err
 		}
-		fmt.Printf("done → %s  [%s] %s\n", relToRoot(cfg, it.Path), it.Type, it.Title)
+		fmt.Printf("done → %s  [%s] %s\n", relToRoot(cfg, matches[0].path), matches[0].bucket, matches[0].label)
 		return nil
 	default:
 		fmt.Fprintf(os.Stderr, "ambiguous — %d open items match %q:\n", len(matches), terms)
 		for _, m := range matches {
-			fmt.Fprintf(os.Stderr, "  [%s] %s\n        id: %s\n", m.Type, m.Title, m.ID)
+			fmt.Fprintf(os.Stderr, "  [%s] %s\n", m.bucket, m.label)
 		}
-		return fmt.Errorf("narrow the terms or pass an exact id")
+		return fmt.Errorf("narrow the terms")
 	}
 }
-
-func cmdTopics(args []string) error {
-	fs := flag.NewFlagSet("topics", flag.ExitOnError)
-	asJSON := fs.Bool("json", false, "output JSON")
-	_ = fs.Parse(args)
-
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	infos, err := store.Topics(cfg)
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(infos)
-	}
-	if len(infos) == 0 {
-		fmt.Println("no topics yet — link items with `ki jot --topic NAME` or a topic: field")
-		return nil
-	}
-	for _, t := range infos {
-		page := ""
-		switch {
-		case t.HasPage:
-			page = "  · page"
-		case t.Items >= 3:
-			page = "  · no page yet (worth compiling one)"
-		}
-		fmt.Printf("%-28s %2d items (%d open)  last %s%s\n", t.Topic, t.Items, t.Open, t.LastActive, page)
-	}
-	return nil
-}
-
-func cmdTopic(args []string) error {
-	fs := flag.NewFlagSet("topic", flag.ExitOnError)
-	full := fs.Bool("full", false, "print full file contents (chronological collation)")
-	asJSON := fs.Bool("json", false, "output JSON")
-	pos := parseMixed(fs, args)
-
-	name := strings.TrimSpace(strings.Join(pos, " "))
-	if name == "" {
-		return fmt.Errorf("usage: ki topic <name> [--full]")
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	items, err := store.ItemsByTopic(cfg, name)
-	if err != nil {
-		return err
-	}
-	pagePath := filepath.Join(cfg.ThreadsPath(), name, "permanent.md")
-	pageData, pageErr := os.ReadFile(pagePath)
-	if pageErr != nil && len(items) == 0 {
-		return fmt.Errorf("no page and no items for topic %q (see: ki topics)", name)
-	}
-
-	if *asJSON {
-		out := struct {
-			Topic string       `json:"topic"`
-			Page  string       `json:"page,omitempty"`
-			Items []store.Item `json:"items"`
-		}{Topic: name, Items: items}
-		if pageErr == nil {
-			out.Page = relToRoot(cfg, pagePath)
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(out)
-	}
-
-	if *full {
-		if pageErr == nil {
-			fmt.Printf("===== page: %s =====\n%s\n", relToRoot(cfg, pagePath), pageData)
-		}
-		for _, it := range items {
-			data, e := os.ReadFile(it.Path)
-			if e != nil {
-				continue
-			}
-			fmt.Printf("===== %s =====\n%s\n", relToRoot(cfg, it.Path), data)
-		}
-		return nil
-	}
-
-	if pageErr == nil {
-		fmt.Println("page:", relToRoot(cfg, pagePath))
-	} else {
-		fmt.Println("page: none (items are the source of truth; compile one when reloads get heavy)")
-	}
-	fmt.Printf("items (%d, oldest first):\n", len(items))
-	for _, it := range items {
-		status := ""
-		if it.Status != "" && it.Status != "open" {
-			status = "  (" + it.Status + ")"
-		}
-		fmt.Printf("  %s  [%s] %s%s\n        %s\n", it.Created, it.Type, it.Title, status, relToRoot(cfg, it.Path))
-	}
-	return nil
-}
-
-func cmdImport(args []string) error {
-	fs := flag.NewFlagSet("import", flag.ExitOnError)
-	dryRun := fs.Bool("dry-run", false, "classify and print the item plan as JSON, write nothing")
-	yes := fs.Bool("yes", false, "write everything without confirming")
-	fs.BoolVar(yes, "y", false, "shorthand for --yes")
-	bucket := fs.String("bucket", "", "skip the classifier; one item per chunk into NAME")
-	fs.StringVar(bucket, "b", "", "shorthand for --bucket")
-	archive := fs.Bool("archive", false, "move source file(s) to _imported/ after writing")
-	targets := parseMixed(fs, args)
-
-	if len(targets) == 0 {
-		return fmt.Errorf("usage: ki import <file-or-folder>... [--dry-run] [-y] [--archive]")
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	if *bucket != "" && !cfg.HasBucket(*bucket) {
-		return fmt.Errorf("unknown bucket %q (configured: %s)", *bucket, strings.Join(cfg.BucketNames(), ", "))
-	}
-	today := time.Now().Format("2006-01-02")
-
-	var files []string
-	for _, target := range targets {
-		fl, e := gatherImportFiles(target)
-		if e != nil {
-			return e
-		}
-		files = append(files, fl...)
-	}
-	if len(files) == 0 {
-		return fmt.Errorf("no .md or .txt files found under %s", strings.Join(targets, ", "))
-	}
-
-	imported := map[string]bool{}
-	if existing, e := store.ScanItems(cfg); e == nil {
-		for _, it := range existing {
-			imported[it.Source] = true
-		}
-	}
-
-	topics := store.TopicNames(cfg)
-	var cls []store.Classification
-	var sources []string
-	for _, fp := range files {
-		base := filepath.Base(fp)
-		if imported["import:"+base] {
-			fmt.Fprintf(os.Stderr, "[warn] items with source import:%s already exist — re-importing will create duplicates\n", base)
-		}
-		data, e := os.ReadFile(fp)
-		if e != nil {
-			return e
-		}
-		chunks := store.SplitChunks(string(data), store.FileDate(base))
-		for i, ch := range chunks {
-			var got []store.Classification
-			if *bucket != "" {
-				got = []store.Classification{{Bucket: *bucket, Title: store.FirstLine(ch.Text), Body: ch.Text, Created: ch.Date}}
-			} else {
-				fmt.Fprintf(os.Stderr, "classifying %s — chunk %d/%d…\n", base, i+1, len(chunks))
-				got, e = classify.ClassifyBatch(cfg, ch.Text, topics, today, ch.Date)
-				if e != nil {
-					return e
-				}
-			}
-			cls = append(cls, got...)
-			for range got {
-				sources = append(sources, "import:"+base)
-			}
-		}
-	}
-	if len(cls) == 0 {
-		return fmt.Errorf("classifier produced no items")
-	}
-
-	if *dryRun {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(cls)
-	}
-
-	items := make([]store.Item, len(cls))
-	for i, cl := range cls {
-		items[i] = store.NewItem(cl, today, sources[i])
-	}
-
-	fmt.Printf("\nplanned items (%d):\n", len(items))
-	for _, it := range items {
-		extra := ""
-		if it.Due != "" {
-			extra += "  due " + it.Due
-		}
-		if it.Topic != "" {
-			extra += "  topic " + it.Topic
-		}
-		fmt.Printf("  %s  [%-8s] %s%s\n", it.Created, it.Type, it.Title, extra)
-	}
-
-	pick := false
-	if !*yes {
-		fmt.Print("\n[Y] write all  [i] pick one by one  [n] cancel > ")
-		reader := bufio.NewReader(os.Stdin)
-		line, e := reader.ReadString('\n')
-		if e != nil && line == "" {
-			fmt.Println()
-			return nil
-		}
-		switch strings.ToLower(strings.TrimSpace(line)) {
-		case "y", "yes", "":
-		case "i", "pick":
-			pick = true
-		default:
-			fmt.Println("cancelled")
-			return nil
-		}
-	}
-
-	written := 0
-	for i := range items {
-		if pick {
-			ok, e := confirm(cfg, &items[i])
-			if e != nil {
-				return e
-			}
-			if !ok {
-				fmt.Println("  skipped:", items[i].Title)
-				continue
-			}
-		}
-		path, e := store.WriteItem(cfg, items[i])
-		if e != nil {
-			return e
-		}
-		written++
-		fmt.Printf("saved → %s  [%s]\n", relToRoot(cfg, path), items[i].Type)
-	}
-	fmt.Printf("imported %d/%d items\n", written, len(items))
-
-	if *archive && written > 0 {
-		dir := filepath.Join(cfg.Root(), "_imported")
-		if e := os.MkdirAll(dir, 0o755); e != nil {
-			return e
-		}
-		for _, fp := range files {
-			dst := filepath.Join(dir, filepath.Base(fp))
-			if e := os.Rename(fp, dst); e != nil {
-				return e
-			}
-			fmt.Printf("archived source → %s\n", relToRoot(cfg, dst))
-		}
-	}
-	return nil
-}
-
-// gatherImportFiles resolves the import target to a list of note files. For a
-// directory it walks recursively, skipping hidden and `_`-prefixed dirs.
-func gatherImportFiles(target string) ([]string, error) {
-	info, err := os.Stat(target)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() {
-		return []string{target}, nil
-	}
-	var out []string
-	err = filepath.WalkDir(target, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		base := d.Name()
-		if d.IsDir() {
-			if p != target && (strings.HasPrefix(base, ".") || strings.HasPrefix(base, "_")) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if strings.HasSuffix(base, ".md") || strings.HasSuffix(base, ".txt") {
-			out = append(out, p)
-		}
-		return nil
-	})
-	sort.Strings(out)
-	return out, err
-}
-
